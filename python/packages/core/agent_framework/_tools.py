@@ -1342,7 +1342,7 @@ async def _auto_invoke_function(
     tool: FunctionTool | None = None
     # Track if this is a re-invocation after policy violation approval
     policy_approval_granted = False
-    
+
     if function_call_content.type == "function_call":
         tool = tool_map.get(function_call_content.name)  # type: ignore[arg-type]
         # Tool should exist because _try_execute_function_calls validates this
@@ -1364,14 +1364,17 @@ async def _auto_invoke_function(
         if tool is None:
             # we assume it is a hosted tool
             return function_call_content
-        
+
         # Check if this is an approval for a policy violation
         # The additional_properties may contain {"policy_violation": True, ...} or just truthy value
-        approval_props = getattr(function_call_content, "additional_properties", None) or {}
-        if approval_props.get("policy_violation"):
+        approval_props: dict[str, Any] = getattr(function_call_content, "additional_properties", None) or {}
+        if isinstance(approval_props, dict) and approval_props.get("policy_violation"):
             policy_approval_granted = True
-        
-        function_call_content = function_call_content.function_call
+
+        fc = function_call_content.function_call  # type: ignore[union-attr]
+        if fc is None:
+            return function_call_content
+        function_call_content = fc
 
     parsed_args: dict[str, Any] = dict(function_call_content.parse_arguments() or {})
 
@@ -1447,10 +1450,10 @@ async def _auto_invoke_function(
         session=invocation_session,
         kwargs=runtime_kwargs.copy(),
     )
-    
+
     # Always pass call_id to middleware for policy violation approval flow
     middleware_context.metadata["call_id"] = function_call_content.call_id
-    
+
     # Pass policy approval flag to middleware via metadata (for re-invocation after approval)
     if policy_approval_granted:
         middleware_context.metadata["policy_approval_granted"] = True
@@ -1470,17 +1473,16 @@ async def _auto_invoke_function(
             context=middleware_context,
             final_handler=final_function_handler,
         )
-        
+
         # Pass through function_approval_request directly (e.g., from security middleware)
         if isinstance(function_result, Content) and function_result.type == "function_approval_request":
             return function_result
-        
-        result_content = Content.from_function_result(
-            call_id=function_call_content.call_id,
+
+        return Content.from_function_result(
+            call_id=function_call_content.call_id,  # type: ignore[arg-type]
             result=function_result,
         )
-        
-        return result_content
+
     except MiddlewareTermination as term_exc:
         # Re-raise to signal loop termination, but first capture any result set by middleware
         if middleware_context.result is not None:
@@ -1796,7 +1798,7 @@ def _replace_approval_contents_with_results(
     approved_function_results: list[Content],
 ) -> None:
     """Replace approval request/response contents with function call/result contents in-place.
-    
+
     Also replaces placeholder tool results (marked with [APPROVAL_PENDING]) with actual results.
     """
     from ._types import (
@@ -1804,16 +1806,16 @@ def _replace_approval_contents_with_results(
     )
 
     # Build a map of call_id -> actual result for replacing placeholders
-    result_by_call_id: dict[str, Contents] = {}
+    result_by_call_id: dict[str, Content] = {}
     for resp in fcc_todo.values():
         if resp.approved:
             # Map the call_id from the function_call to be replaced
-            call_id = resp.function_call.call_id
-            if call_id not in result_by_call_id and approved_function_results:
+            call_id = resp.function_call.call_id  # type: ignore[union-attr]
+            if call_id and call_id not in result_by_call_id and approved_function_results:
                 idx = len(result_by_call_id)
                 if idx < len(approved_function_results):
                     result_by_call_id[call_id] = approved_function_results[idx]
-    
+
     # Track which call_ids had their placeholders replaced
     placeholders_replaced: set[str] = set()
 
@@ -1840,12 +1842,12 @@ def _replace_approval_contents_with_results(
                     contents_to_remove.append(content_idx)
                 else:
                     # Put back the function call content only if it doesn't exist
-                    msg.contents[content_idx] = content.function_call
+                    msg.contents[content_idx] = content.function_call  # type: ignore[assignment]
             elif content.type == "function_approval_response":
                 # Skip hosted tool approvals — they must pass through to the API unchanged
                 if _is_hosted_tool_approval(content):
                     continue
-                call_id = content.function_call.call_id
+                call_id = content.function_call.call_id  # type: ignore[union-attr]
                 if content.approved and content.id in fcc_todo:
                     # Check if we already replaced a placeholder for this call_id
                     if call_id in placeholders_replaced:
@@ -1869,7 +1871,7 @@ def _replace_approval_contents_with_results(
             elif content.type == "function_result":
                 # Check if this is a placeholder result that should be replaced
                 if (
-                    hasattr(content, "result") 
+                    hasattr(content, "result")
                     and isinstance(content.result, str)
                     and "[APPROVAL_PENDING]" in content.result
                     and content.call_id in result_by_call_id
@@ -1881,15 +1883,15 @@ def _replace_approval_contents_with_results(
         # Remove contents marked for removal (in reverse order to preserve indices)
         for idx in reversed(contents_to_remove):
             msg.contents.pop(idx)
-    
+
     # Second pass: Remove messages that are now empty after content removal
     # We need to iterate in reverse to safely remove by index
-    messages_to_remove = []
+    messages_to_remove: list[int] = []
     for msg_idx, msg in enumerate(messages):
         if not msg.contents:
             messages_to_remove.append(msg_idx)
-    for msg_idx in reversed(messages_to_remove):
-        messages.pop(msg_idx)
+    for idx in reversed(messages_to_remove):
+        messages.pop(idx)
 
 
 def _get_result_hooks_from_stream(stream: Any) -> list[Callable[[Any], Any]]:
