@@ -48,7 +48,9 @@ __all__ = [
     "LabeledMessage",
     "PolicyEnforcementFunctionMiddleware",
     "SecureAgentConfig",
+    "SecureMCPToolProxy",
     "VariableReferenceContent",
+    "apply_mcp_security_labels",
     "check_confidentiality_allowed",
     "combine_labels",
     "get_current_middleware",
@@ -2682,3 +2684,345 @@ def get_security_tools() -> list[FunctionTool]:
             )
     """
     return [quarantined_llm, inspect_variable]
+
+
+# =============================================================================
+# MCP Auto-Labeling
+# =============================================================================
+
+
+def _map_mcp_annotations_to_labels(
+    annotations: Any | None,
+    *,
+    default_integrity: IntegrityLabel = IntegrityLabel.UNTRUSTED,
+) -> tuple[IntegrityLabel, ConfidentialityLabel | None, bool]:
+    """Map MCP ToolAnnotations to FIDES security labels.
+
+    Uses the standard MCP hint fields (``readOnlyHint``, ``destructiveHint``,
+    ``openWorldHint``) to infer an appropriate ``source_integrity``,
+    ``max_allowed_confidentiality``, and ``accepts_untrusted`` flag.
+
+    Mapping rules (conservative – when in doubt, default to UNTRUSTED):
+
+    * ``readOnlyHint=True`` → ``accepts_untrusted=True`` (pure data source,
+      safe to call even when the context is tainted — it cannot exfiltrate).
+    * ``openWorldHint=True`` → UNTRUSTED (tool touches external data).
+    * ``readOnlyHint=False`` (write tool) → ``accepts_untrusted=False``;
+      ``max_allowed_confidentiality`` is set to PUBLIC to treat the tool as a
+      *sink* and prevent data exfiltration through its arguments.
+    * All hints absent / ``None`` → ``default_integrity`` (UNTRUSTED by default),
+      ``accepts_untrusted=False``.
+
+    Args:
+        annotations: An MCP ``ToolAnnotations`` object (or ``None``).
+        default_integrity: Fallback integrity when hints are absent.
+
+    Returns:
+        A ``(integrity, max_confidentiality, accepts_untrusted)`` tuple.
+        ``max_confidentiality`` is ``None`` for read-only / source tools and
+        ``PUBLIC`` for sinks.  ``accepts_untrusted`` is ``True`` for read-only
+        tools that are safe to invoke in a tainted context.
+    """
+    if annotations is None:
+        return (default_integrity, None, False)
+
+    read_only: bool | None = getattr(annotations, "readOnlyHint", None)
+    destructive: bool | None = getattr(annotations, "destructiveHint", None)
+    open_world: bool | None = getattr(annotations, "openWorldHint", None)
+
+    # --- Determine integrity ---
+    integrity = default_integrity
+
+    if open_world is True:
+        # Interacts with external entities → untrusted data
+        integrity = IntegrityLabel.UNTRUSTED
+    elif open_world is False:
+        # Closed-world tool (e.g., local memory) → data is trusted
+        integrity = IntegrityLabel.TRUSTED
+    elif read_only is True:
+        # Pure data source → content is untrusted
+        integrity = IntegrityLabel.UNTRUSTED
+    elif read_only is False:
+        # Write tool – integrity of *returned results* is still untrusted by
+        # default (server acknowledgement text could be attacker-controlled).
+        integrity = IntegrityLabel.UNTRUSTED
+
+    # --- Determine max_allowed_confidentiality (sink detection) ---
+    max_confidentiality: ConfidentialityLabel | None = None
+
+    if read_only is False:
+        # Any write tool is a potential exfiltration sink → restrict to PUBLIC
+        max_confidentiality = ConfidentialityLabel.PUBLIC
+    elif read_only is None and destructive is True:
+        # Destructive but readOnly not declared → still a write sink
+        max_confidentiality = ConfidentialityLabel.PUBLIC
+
+    # --- Determine accepts_untrusted ---
+    # Read-only tools are pure data sources; they cannot exfiltrate data,
+    # so they are safe to call even when the agent context is tainted.
+    accepts_untrusted = read_only is True
+
+    return (integrity, max_confidentiality, accepts_untrusted)
+
+
+@experimental(feature_id=ExperimentalFeature.FIDES)
+async def apply_mcp_security_labels(
+    mcp_tool: Any,
+    *,
+    default_integrity: IntegrityLabel = IntegrityLabel.UNTRUSTED,
+    annotation_overrides: dict[str, tuple[IntegrityLabel, ConfidentialityLabel | None]] | None = None,
+    mark_write_tools_as_sinks: bool = True,
+) -> None:
+    """Auto-assign FIDES security labels to every tool loaded from an MCP server.
+
+    Reads the MCP ``ToolAnnotations`` hints (``readOnlyHint``,
+    ``destructiveHint``, ``openWorldHint``) that the server advertises for
+    each tool and translates them into ``source_integrity`` and
+    ``max_allowed_confidentiality`` entries in each ``FunctionTool``'s
+    ``additional_properties``.  The existing
+    :class:`LabelTrackingFunctionMiddleware` picks these up automatically
+    (Tier 2 label propagation), so **no middleware changes are needed**.
+
+    Call this **after** the ``MCPTool`` is connected (tools already loaded).
+
+    Args:
+        mcp_tool: A connected ``MCPTool`` instance (``MCPStdioTool``,
+            ``MCPStreamableHTTPTool``, ``MCPWebsocketTool``).
+        default_integrity: Integrity label to assign when the server provides
+            no annotations.  Defaults to ``UNTRUSTED`` (conservative).
+        annotation_overrides: Optional per-tool-name overrides.  Keys are
+            *remote* MCP tool names (as the server exposes them).  Values are
+            ``(IntegrityLabel, ConfidentialityLabel | None)`` tuples that
+            replace the annotation-derived labels entirely.
+        mark_write_tools_as_sinks: When ``True`` (default), non-read-only
+            tools get ``max_allowed_confidentiality=PUBLIC`` to prevent data
+            exfiltration via tool arguments.
+
+    Raises:
+        RuntimeError: If the ``MCPTool`` is not connected.
+
+    Examples:
+        .. code-block:: python
+
+            async with MCPStdioTool(name="github", command="gh-mcp", args=["stdio"]) as mcp:
+                await apply_mcp_security_labels(mcp)
+                agent = ChatCompletionAgent(
+                    chat_client=client,
+                    tools=[mcp],
+                    context_providers=[SecureAgentConfig(chat_client=client)],
+                )
+    """
+    if not getattr(mcp_tool, "is_connected", False):
+        raise RuntimeError(
+            "MCPTool is not connected. Call connect() or use 'async with' before "
+            "applying security labels."
+        )
+
+    session = getattr(mcp_tool, "session", None)
+    if session is None:
+        raise RuntimeError("MCPTool has no active session.")
+
+    # ------------------------------------------------------------------
+    # 1. Fetch tool list (with annotations) from the server
+    # ------------------------------------------------------------------
+    from mcp import types as mcp_types
+
+    annotation_map: dict[str, Any] = {}  # remote_name → ToolAnnotations | None
+    params: mcp_types.PaginatedRequestParams | None = None
+    while True:
+        tool_list = await session.list_tools(params=params)
+        for t in tool_list.tools:
+            annotation_map[t.name] = t.annotations
+        if not tool_list or not tool_list.nextCursor:
+            break
+        params = mcp_types.PaginatedRequestParams(cursor=tool_list.nextCursor)
+
+    # ------------------------------------------------------------------
+    # 2. Patch each FunctionTool's additional_properties
+    # ------------------------------------------------------------------
+    overrides = annotation_overrides or {}
+    functions: list[FunctionTool] = getattr(mcp_tool, "functions", [])
+
+    for func in functions:
+        props = func.additional_properties
+        if props is None:
+            props = {}
+            func.additional_properties = props
+
+        remote_name: str | None = props.get("_mcp_remote_name")
+        if remote_name is None:
+            continue
+
+        # Check for explicit per-tool override first
+        if remote_name in overrides:
+            integrity, max_conf = overrides[remote_name]
+            accepts_untrusted = False  # overrides must opt-in explicitly
+        else:
+            annotations = annotation_map.get(remote_name)
+            integrity, max_conf, accepts_untrusted = _map_mcp_annotations_to_labels(
+                annotations, default_integrity=default_integrity
+            )
+
+        # Patch source_integrity (Tier 2 – read by LabelTrackingFunctionMiddleware)
+        props["source_integrity"] = integrity.value
+
+        # Patch sink constraint
+        if mark_write_tools_as_sinks and max_conf is not None:
+            props["max_allowed_confidentiality"] = max_conf.value
+
+        # Allow read-only tools to execute even when context is tainted;
+        # explicitly block write tools in untrusted contexts.
+        props["accepts_untrusted"] = accepts_untrusted
+
+        logger.info(
+            "MCP auto-label: tool=%s integrity=%s max_confidentiality=%s accepts_untrusted=%s",
+            remote_name,
+            integrity.value,
+            max_conf.value if max_conf else "none",
+            accepts_untrusted,
+        )
+
+
+@experimental(feature_id=ExperimentalFeature.FIDES)
+class SecureMCPToolProxy:
+    """Convenience wrapper that auto-labels MCP tools on connection.
+
+    Wraps any ``MCPTool`` subclass and calls
+    :func:`apply_mcp_security_labels` automatically when entering the async
+    context manager (or when :meth:`connect` is called explicitly).
+
+    The proxy delegates ``functions``, ``is_connected``, and ``name`` to the
+    wrapped tool.  Pass ``proxy.tools`` (or ``proxy.functions``) directly to
+    the agent's ``tools=`` parameter.
+
+    There are two ways to create a proxy:
+
+    1. **Wrap an existing MCPTool** (local binary, WebSocket, or HTTP)::
+
+        async with SecureMCPToolProxy(
+            MCPStdioTool(name="github", command="gh-mcp", args=["stdio"])
+        ) as proxy:
+            agent = Agent(client=client, tools=proxy.tools, ...)
+
+    2. **Provide a URL** (auto-creates ``MCPStreamableHTTPTool`` internally)::
+
+        async with SecureMCPToolProxy(
+            url="https://mcp.example.com/",
+            headers={"Authorization": "Bearer <token>"},
+            name="my-mcp",
+        ) as proxy:
+            agent = Agent(client=client, tools=proxy.tools, ...)
+
+    The URL mode ensures the MCP server is called **locally** by your
+    application (not by the model provider), so
+    :class:`LabelTrackingFunctionMiddleware` and
+    :class:`PolicyEnforcementFunctionMiddleware` can intercept every tool
+    call.  This is in contrast to the *hosted MCP* approach
+    (``client.get_mcp_tool()``) where the provider calls the MCP server
+    remotely and security middleware is bypassed entirely.
+
+    Args:
+        mcp_tool: An ``MCPTool`` instance to wrap.  Mutually exclusive with
+            *url*.
+        url: URL of a remote MCP server.  When provided, the proxy creates
+            an ``MCPStreamableHTTPTool`` internally.  Mutually exclusive with
+            *mcp_tool*.
+        headers: HTTP headers (e.g. auth tokens) sent with every request
+            when using *url* mode.
+        name: Tool name used when creating the internal
+            ``MCPStreamableHTTPTool`` (defaults to ``"mcp"``).
+        description: Tool description for the internal tool.
+        default_integrity: Default integrity for tools without annotations.
+        annotation_overrides: Per-tool-name label overrides (keyed by remote
+            MCP tool name).
+        mark_write_tools_as_sinks: Whether to restrict write tools to PUBLIC
+            confidentiality.
+    """
+
+    def __init__(
+        self,
+        mcp_tool: Any | None = None,
+        *,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        default_integrity: IntegrityLabel = IntegrityLabel.UNTRUSTED,
+        annotation_overrides: dict[str, tuple[IntegrityLabel, ConfidentialityLabel | None]] | None = None,
+        mark_write_tools_as_sinks: bool = True,
+    ) -> None:
+        if mcp_tool is not None and url is not None:
+            raise ValueError("Provide either 'mcp_tool' or 'url', not both.")
+        if mcp_tool is None and url is None:
+            raise ValueError("Provide either 'mcp_tool' (an MCPTool instance) or 'url' (a remote MCP server URL).")
+
+        if url is not None:
+            from ._mcp import MCPStreamableHTTPTool
+
+            static_headers = dict(headers or {})
+            mcp_tool = MCPStreamableHTTPTool(
+                name=name or "mcp",
+                url=url,
+                header_provider=lambda kwargs: static_headers,
+                description=description,
+            )
+
+        self._mcp_tool = mcp_tool
+        self._default_integrity = default_integrity
+        self._annotation_overrides = annotation_overrides
+        self._mark_write_tools_as_sinks = mark_write_tools_as_sinks
+
+    # -- Async context manager --
+
+    async def __aenter__(self) -> "SecureMCPToolProxy":
+        await self._mcp_tool.__aenter__()
+        await self._apply_labels()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self._mcp_tool.__aexit__(exc_type, exc_val, exc_tb)
+
+    # -- Explicit connect/disconnect --
+
+    async def connect(self) -> None:
+        """Connect the underlying MCPTool and apply security labels."""
+        await self._mcp_tool.connect()
+        await self._apply_labels()
+
+    async def disconnect(self) -> None:
+        """Disconnect the underlying MCPTool."""
+        await self._mcp_tool.disconnect()
+
+    # -- Delegated properties --
+
+    @property
+    def name(self) -> str:
+        return self._mcp_tool.name
+
+    @property
+    def is_connected(self) -> bool:
+        return self._mcp_tool.is_connected
+
+    @property
+    def functions(self) -> list[FunctionTool]:
+        return self._mcp_tool.functions
+
+    @property
+    def tools(self) -> list[FunctionTool]:
+        """Alias for :attr:`functions` – the labeled tool list."""
+        return self.functions
+
+    @property
+    def mcp_tool(self) -> Any:
+        """Access the underlying ``MCPTool`` instance."""
+        return self._mcp_tool
+
+    # -- Internal --
+
+    async def _apply_labels(self) -> None:
+        await apply_mcp_security_labels(
+            self._mcp_tool,
+            default_integrity=self._default_integrity,
+            annotation_overrides=self._annotation_overrides,
+            mark_write_tools_as_sinks=self._mark_write_tools_as_sinks,
+        )

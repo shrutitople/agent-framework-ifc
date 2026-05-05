@@ -1,7 +1,6 @@
 # FIDES security samples
 
-This folder contains two runnable FIDES samples that use
-`agent_framework.foundry.FoundryChatClient`. Keep this README as the quick
+This folder contains runnable FIDES samples. Keep this README as the quick
 entry point for choosing and running a sample; use
 [FIDES_DEVELOPER_GUIDE.md](FIDES_DEVELOPER_GUIDE.md) for the architecture,
 security model, middleware behavior, and API reference.
@@ -12,6 +11,8 @@ security model, middleware behavior, and API reference.
 |--------|-------|--------------|
 | `email_security_example.py` | Prompt injection defense | `SecureAgentConfig`, Foundry-backed email handling, `quarantined_llm`, and approval on policy violations |
 | `repo_confidentiality_example.py` | Data exfiltration prevention | Confidentiality labels, Foundry-backed repository access, `max_allowed_confidentiality`, and approval before leaking private data |
+| `mcp_url_fides_example.py` | Remote MCP URL + local IFC/FIDES | `SecureMCPToolProxy(url=...)`, MCP annotation auto-labeling, post-tool-call enforcement, and security audit logging |
+| `mcp_workiq_teams_example.py` | Work IQ Teams MCP + MSAL auth | `SecureMCPToolProxy(url=...)` with OAuth bearer token, MSAL interactive sign-in, Work IQ Teams MCP integration |
 
 ## Prerequisites
 
@@ -23,8 +24,14 @@ environment available.
 - `FOUNDRY_MODEL` set in your environment for the main agent deployment
 - Local dev environment installed (for example, `uv sync --dev`)
 
-Both samples use `FOUNDRY_MODEL` for the main agent and keep the quarantine
-client pinned to `gpt-4o-mini`.
+Foundry-backed samples use `FOUNDRY_MODEL` for the main agent and keep the
+quarantine client pinned to `gpt-4o-mini`.
+
+For `mcp_url_fides_example.py`, set:
+
+- `GITHUB_PAT` (GitHub Personal Access Token)
+- `FOUNDRY_PROJECT_ENDPOINT` (Foundry project endpoint)
+- `FOUNDRY_MODEL` (optional model override)
 
 ## Suppressing the experimental warning
 
@@ -71,6 +78,52 @@ What to look for:
 - Reading public content keeps the context public
 - Reading private content taints the context as private
 - Posting private data to a public destination triggers an approval request
+
+### `mcp_url_fides_example.py`
+
+This sample connects directly to `https://api.githubcopilot.com/mcp/` but runs
+MCP calls locally through `SecureMCPToolProxy(url=...)` so IFC/FIDES middleware
+can enforce policy after tool calls.
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/mcp_url_fides_example.py
+uv run samples/02-agents/security/mcp_url_fides_example.py --attack
+```
+
+What to look for:
+
+- Tools are auto-labeled from MCP `ToolAnnotations`
+- Untrusted data is tracked/hidden by FIDES label middleware
+- Write attempts from tainted context generate policy audit entries
+
+### `mcp_workiq_teams_example.py`
+
+This sample connects to a Work IQ Teams MCP server using MSAL (Microsoft
+Authentication Library) for interactive Entra ID sign-in. It demonstrates
+OAuth-based remote MCP connectivity with local FIDES enforcement.
+
+Prerequisites for this sample:
+
+- `FOUNDRY_PROJECT_ENDPOINT` (Foundry project endpoint)
+- `FOUNDRY_MODEL` (optional model override, defaults to o4-mini)
+- Microsoft 365 Copilot license in your tenant
+- First run will open a browser for interactive Microsoft 365 sign-in
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/mcp_workiq_teams_example.py
+uv run samples/02-agents/security/mcp_workiq_teams_example.py --attack
+```
+
+What to look for:
+
+- MSAL token acquisition and browser-based interactive sign-in
+- OAuth bearer token integration with `MCPStreamableHTTPTool`
+- MCP tools auto-labeled from Work IQ Teams annotations
+- Policy enforcement for Teams operations (e.g., message posting)
 
 ## Where to find the details
 
