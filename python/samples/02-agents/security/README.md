@@ -1,6 +1,11 @@
 # FIDES security samples
 
+<<<<<<< HEAD
 This folder contains runnable FIDES samples. Keep this README as the quick
+=======
+This folder contains two runnable FIDES samples that use
+`agent_framework.foundry.FoundryChatClient`. Keep this README as the quick
+>>>>>>> 7d4c3723a777da54ad9f567915b628c695acaa0c
 entry point for choosing and running a sample; use
 [FIDES_DEVELOPER_GUIDE.md](FIDES_DEVELOPER_GUIDE.md) for the architecture,
 security model, middleware behavior, and API reference.
@@ -11,8 +16,11 @@ security model, middleware behavior, and API reference.
 |--------|-------|--------------|
 | `email_security_example.py` | Prompt injection defense | `SecureAgentConfig`, Foundry-backed email handling, `quarantined_llm`, and approval on policy violations |
 | `repo_confidentiality_example.py` | Data exfiltration prevention | Confidentiality labels, Foundry-backed repository access, `max_allowed_confidentiality`, and approval before leaking private data |
+<<<<<<< HEAD
 | `mcp_url_fides_example.py` | Remote MCP URL + local IFC/FIDES | `SecureMCPToolProxy(url=...)`, MCP annotation auto-labeling, post-tool-call enforcement, and security audit logging |
 | `mcp_workiq_teams_example.py` | Work IQ Teams MCP + MSAL auth | `SecureMCPToolProxy(url=...)` with OAuth bearer token, MSAL interactive sign-in, Work IQ Teams MCP integration |
+=======
+>>>>>>> 7d4c3723a777da54ad9f567915b628c695acaa0c
 
 ## Prerequisites
 
@@ -24,6 +32,7 @@ environment available.
 - `FOUNDRY_MODEL` set in your environment for the main agent deployment
 - Local dev environment installed (for example, `uv sync --dev`)
 
+<<<<<<< HEAD
 Foundry-backed samples use `FOUNDRY_MODEL` for the main agent and keep the
 quarantine client pinned to `gpt-4o-mini`.
 
@@ -32,6 +41,10 @@ For `mcp_url_fides_example.py`, set:
 - `GITHUB_PAT` (GitHub Personal Access Token)
 - `FOUNDRY_PROJECT_ENDPOINT` (Foundry project endpoint)
 - `FOUNDRY_MODEL` (optional model override)
+=======
+Both samples use `FOUNDRY_MODEL` for the main agent and keep the quarantine
+client pinned to `gpt-4o-mini`.
+>>>>>>> 7d4c3723a777da54ad9f567915b628c695acaa0c
 
 ## Suppressing the experimental warning
 
