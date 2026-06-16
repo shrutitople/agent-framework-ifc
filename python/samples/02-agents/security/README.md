@@ -12,6 +12,7 @@ security model, middleware behavior, and API reference.
 | `email_security_example.py` | Prompt injection defense | `SecureAgentConfig`, Foundry-backed email handling, `quarantined_llm`, and approval on policy violations |
 | `repo_confidentiality_example.py` | Data exfiltration prevention | Confidentiality labels, Foundry-backed repository access, `max_allowed_confidentiality`, and approval before leaking private data |
 | `github_mcp_example.py` | Remote MCP URL with local FIDES enforcement | `SecureMCPToolProxy(url=...)`, direct GitHub MCP access, tool auto-labeling, and post-tool-call policy enforcement |
+| `playwright_mcp_example.py` | Local stdio MCP server with browser automation | `SecureMCPToolProxy(MCPStdioTool(...))`, Playwright browser control, untrusted web-page labeling, and auto-hiding of page snapshots |
 
 ## Prerequisites
 
@@ -109,6 +110,39 @@ What to look for:
 - MCP tools are auto-labeled from remote annotations
 - Untrusted tool output is tracked by FIDES label middleware
 - Attack-mode write attempts can trigger policy enforcement or approval
+
+### `playwright_mcp_example.py`
+
+This sample drives a real browser through the official Playwright MCP server
+(`npx @playwright/mcp@latest`) running locally as an `MCPStdioTool`, wrapped in
+`SecureMCPToolProxy` so FIDES middleware can label and enforce policy on every
+browser tool result. The demo task opens the Amazon UK home page and searches for
+"shoes". Web pages are untrusted by nature, making this a realistic
+prompt-injection setting: page snapshots are labeled UNTRUSTED and hidden behind
+variable references.
+
+Extra prerequisite: Node.js on PATH. The first run downloads `@playwright/mcp`.
+Install the Chromium build the MCP server expects with its own installer (the
+global `playwright` CLI may install a different revision):
+
+```bash
+npx @playwright/mcp@latest install-browser chromium
+```
+
+Run it with:
+
+```bash
+uv run samples/02-agents/security/playwright_mcp_example.py --cli
+uv run samples/02-agents/security/playwright_mcp_example.py --cli --headless
+uv run samples/02-agents/security/playwright_mcp_example.py --devui
+uv run samples/02-agents/security/playwright_mcp_example.py --devui --debug
+```
+
+What to look for:
+
+- Playwright tools are auto-labeled on connect by `SecureMCPToolProxy`
+- Browser page snapshots taint the context as UNTRUSTED
+- Untrusted page content is hidden behind variable references before reaching the agent
 
 ## Where to find the details
 
